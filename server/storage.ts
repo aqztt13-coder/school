@@ -47,6 +47,12 @@ function isDirWritable(dir: string): boolean {
     const probe = path.join(dir, `.rowad-probe-${process.pid}-${Date.now()}`);
     fs.writeFileSync(probe, 'ok', 'utf-8');
     fs.unlinkSync(probe);
+    for (const fileName of ['rowad.db', 'rowad.db-wal', 'rowad.db-shm']) {
+      const target = path.join(dir, fileName);
+      if (fs.existsSync(target)) {
+        fs.accessSync(target, fs.constants.R_OK | fs.constants.W_OK);
+      }
+    }
     return true;
   } catch {
     return false;

@@ -4,6 +4,17 @@ import type {
   RegisterInput,
   UpdateProfileInput,
 } from './studentLogic';
+import {
+  LocalDbError,
+  hydrateLocalDbFromIndexedDb,
+  localAuthenticateStudent,
+  localDeleteSession,
+  localGetStudentByToken,
+  localListAllPublicStudents,
+  localRegisterStudent,
+  localUpdateStudentProfile,
+  mirrorServerStudentIntoLocalDb,
+} from './localDatabase';
 
 const TOKEN_STORAGE_KEY = 'rowad_auth_token';
 const CACHED_STUDENT_KEY = 'rowad_cached_student';
@@ -61,6 +72,19 @@ export class ApiError extends Error {
   }
 }
 
+class BackendUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+function mapLocalError(err: unknown): never {
+  if (err instanceof LocalDbError) {
+    throw new ApiError(err.message, err.status, err.fieldErrors);
+  }
+  throw err;
+}
+
 async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = getStoredToken();
   const headers: Record<string, string> = {
@@ -71,18 +95,37 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const response = await fetch(path, {
-    ...init,
-    headers,
-    credentials: 'include',
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      headers,
+      credentials: 'include',
+    });
+  } catch {
+    throw new BackendUnavailableError('Network or offline failure');
+  }
 
   const contentType = response.headers.get('content-type') ?? '';
   const data = contentType.includes('application/json')
-    ? await response.json().catch(() => ({}))
+    ? await response.json().catch(() => null)
     : await response.json().catch(() => null);
 
   if (!response.ok) {
+    // When running on static hosting (e.g. shared preview without Express server),
+    // API endpoints return non-JSON 404/405/501/502/503/504 responses.
+    if (
+      !data &&
+      (response.status === 404 ||
+        response.status === 405 ||
+        response.status === 501 ||
+        response.status === 502 ||
+        response.status === 503 ||
+        response.status === 504)
+    ) {
+      throw new BackendUnavailableError(`Backend endpoint returned ${response.status}`);
+    }
+
     const fallbackMsg =
       response.status >= 500
         ? 'حدث خطأ في قاعدة البيانات أو الخادم. يرجى المحاولة مرة أخرى.'
@@ -95,7 +138,7 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (!data || typeof data !== 'object') {
-    throw new ApiError('استجابة الخادم غير صالحة. يرجى تحديث الصفحة والمحاولة مرة أخرى.', response.status);
+    throw new BackendUnavailableError('Non-JSON 200 response from static fallback');
   }
   return data as T;
 }
@@ -103,28 +146,73 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
 export async function loginStudentApi(
   payload: LoginInput,
 ): Promise<{ student: PublicStudent; token: string }> {
-  const result = await apiRequest<{ student: PublicStudent; token: string }>('/api/auth/login', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
-  setStoredToken(result.token);
-  writeCachedJson(CACHED_STUDENT_KEY, result.student);
-  return result;
+  await hydrateLocalDbFromIndexedDb();
+  try {
+    const result = await apiRequest<{ student: PublicStudent; token: string }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    setStoredToken(result.token);
+    writeCachedJson(CACHED_STUDENT_KEY, result.student);
+    mirrorServerStudentIntoLocalDb(result.student, result.token);
+    return result;
+  } catch (err) {
+    if (err instanceof BackendUnavailableError) {
+      try {
+        const localResult = localAuthenticateStudent(payload);
+        setStoredToken(localResult.token);
+        writeCachedJson(CACHED_STUDENT_KEY, localResult.student);
+        return localResult;
+      } catch (localErr) {
+        mapLocalError(localErr);
+      }
+    }
+    throw err;
+  }
 }
 
 export async function registerStudentApi(
   payload: RegisterInput,
 ): Promise<{ student: PublicStudent; token: string }> {
-  const result = await apiRequest<{ student: PublicStudent; token: string }>('/api/auth/register', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
-  setStoredToken(result.token);
-  writeCachedJson(CACHED_STUDENT_KEY, result.student);
-  return result;
+  await hydrateLocalDbFromIndexedDb();
+  try {
+    const result = await apiRequest<{ student: PublicStudent; token: string }>('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    setStoredToken(result.token);
+    writeCachedJson(CACHED_STUDENT_KEY, result.student);
+    mirrorServerStudentIntoLocalDb(result.student, result.token);
+    return result;
+  } catch (err) {
+    if (err instanceof BackendUnavailableError) {
+      try {
+        const localResult = localRegisterStudent(payload);
+        setStoredToken(localResult.token);
+        writeCachedJson(CACHED_STUDENT_KEY, localResult.student);
+        return localResult;
+      } catch (localErr) {
+        mapLocalError(localErr);
+      }
+    }
+    throw err;
+  }
 }
 
 export async function fetchCurrentStudentApi(): Promise<PublicStudent | null> {
+  await hydrateLocalDbFromIndexedDb();
+  const token = getStoredToken();
+  if (token.startsWith('local-')) {
+    const localStudent = localGetStudentByToken(token);
+    if (localStudent) {
+      writeCachedJson(CACHED_STUDENT_KEY, localStudent);
+      return localStudent;
+    }
+    setStoredToken('');
+    writeCachedJson(CACHED_STUDENT_KEY, null);
+    return null;
+  }
+
   try {
     const result = await apiRequest<{ student: PublicStudent | null }>('/api/auth/me');
     if (!result.student) {
@@ -133,13 +221,15 @@ export async function fetchCurrentStudentApi(): Promise<PublicStudent | null> {
       return null;
     }
     writeCachedJson(CACHED_STUDENT_KEY, result.student);
+    mirrorServerStudentIntoLocalDb(result.student, token);
     return result.student;
   } catch (err) {
     if (err instanceof ApiError) {
       throw err;
     }
-    // Network/offline fallback: return last cached authenticated student if token exists
-    if (getStoredToken()) {
+    if (token) {
+      const localStudent = localGetStudentByToken(token);
+      if (localStudent) return localStudent;
       return readCachedJson<PublicStudent>(CACHED_STUDENT_KEY);
     }
     return null;
@@ -149,20 +239,68 @@ export async function fetchCurrentStudentApi(): Promise<PublicStudent | null> {
 export async function updateCurrentStudentApi(
   payload: UpdateProfileInput,
 ): Promise<PublicStudent> {
-  const result = await apiRequest<{ student: PublicStudent }>('/api/students/me', {
-    method: 'PUT',
-    body: JSON.stringify(payload),
-  });
-  writeCachedJson(CACHED_STUDENT_KEY, result.student);
-  return result.student;
+  await hydrateLocalDbFromIndexedDb();
+  const token = getStoredToken();
+  if (token.startsWith('local-')) {
+    try {
+      const updated = localUpdateStudentProfile(token, payload);
+      writeCachedJson(CACHED_STUDENT_KEY, updated);
+      return updated;
+    } catch (localErr) {
+      mapLocalError(localErr);
+    }
+  }
+
+  try {
+    const result = await apiRequest<{ student: PublicStudent }>('/api/students/me', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+    writeCachedJson(CACHED_STUDENT_KEY, result.student);
+    mirrorServerStudentIntoLocalDb(result.student, token);
+    return result.student;
+  } catch (err) {
+    if (err instanceof BackendUnavailableError) {
+      try {
+        const updated = localUpdateStudentProfile(token, payload);
+        writeCachedJson(CACHED_STUDENT_KEY, updated);
+        return updated;
+      } catch (localErr) {
+        mapLocalError(localErr);
+      }
+    }
+    throw err;
+  }
 }
 
 export async function fetchAllStudentsApi(): Promise<PublicStudent[]> {
+  await hydrateLocalDbFromIndexedDb();
+  const token = getStoredToken();
+  if (token.startsWith('local-')) {
+    try {
+      const list = localListAllPublicStudents(token);
+      writeCachedJson(CACHED_STUDENTS_KEY, list);
+      return list;
+    } catch (localErr) {
+      mapLocalError(localErr);
+    }
+  }
+
   try {
     const result = await apiRequest<{ students: PublicStudent[] }>('/api/students');
     writeCachedJson(CACHED_STUDENTS_KEY, result.students);
     return result.students;
   } catch (err) {
+    if (err instanceof BackendUnavailableError) {
+      try {
+        const list = localListAllPublicStudents(token);
+        writeCachedJson(CACHED_STUDENTS_KEY, list);
+        return list;
+      } catch {
+        const cached = readCachedJson<PublicStudent[]>(CACHED_STUDENTS_KEY);
+        if (cached) return cached;
+      }
+    }
     if (err instanceof ApiError) {
       throw err;
     }
@@ -173,9 +311,15 @@ export async function fetchAllStudentsApi(): Promise<PublicStudent[]> {
 }
 
 export async function logoutStudentApi(): Promise<void> {
+  const token = getStoredToken();
   try {
-    await apiRequest<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
+    if (!token.startsWith('local-')) {
+      await apiRequest<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
+    }
+  } catch {
+    // Always complete logout locally even if server/network is unavailable
   } finally {
+    localDeleteSession(token);
     setStoredToken('');
     writeCachedJson(CACHED_STUDENT_KEY, null);
     writeCachedJson(CACHED_STUDENTS_KEY, null);
