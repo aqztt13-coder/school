@@ -9,6 +9,7 @@ import {
   type PublicStudent,
 } from '../utils/studentLogic';
 import { ApiError, loginStudentApi, registerStudentApi } from '../utils/api';
+import { PWAInstallButton } from './PWAInstallButton';
 
 const CAMPUS_IMAGE_URL = '/src/assets/images/rowad_campus_courtyard_1794898618341.jpg';
 const CREST_IMAGE_URL = '/src/assets/images/rowad_school_crest_1794898618509.jpg';
@@ -630,6 +631,10 @@ export function AuthScreen({ mode, onModeChange, onAuthenticated }: AuthScreenPr
                   </div>
                 </form>
               )}
+            </div>
+
+            <div className="mt-4 flex justify-center">
+              <PWAInstallButton variant="subtle" />
             </div>
           </div>
         </section>

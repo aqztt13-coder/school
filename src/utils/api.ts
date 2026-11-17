@@ -6,6 +6,8 @@ import type {
 } from './studentLogic';
 
 const TOKEN_STORAGE_KEY = 'rowad_auth_token';
+const CACHED_STUDENT_KEY = 'rowad_cached_student';
+const CACHED_STUDENTS_KEY = 'rowad_cached_students';
 
 export function getStoredToken(): string {
   try {
@@ -24,6 +26,27 @@ export function setStoredToken(token: string): void {
     }
   } catch {
     // Ignore storage quota/access errors
+  }
+}
+
+function readCachedJson<T>(key: string): T | null {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedJson(key: string, value: unknown): void {
+  try {
+    if (value === null) {
+      window.localStorage.removeItem(key);
+    } else {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    }
+  } catch {
+    // Ignore storage errors
   }
 }
 
@@ -54,13 +77,25 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
     credentials: 'include',
   });
 
-  const data = await response.json().catch(() => ({}));
+  const contentType = response.headers.get('content-type') ?? '';
+  const data = contentType.includes('application/json')
+    ? await response.json().catch(() => ({}))
+    : await response.json().catch(() => null);
+
   if (!response.ok) {
+    const fallbackMsg =
+      response.status >= 500
+        ? 'حدث خطأ في قاعدة البيانات أو الخادم. يرجى المحاولة مرة أخرى.'
+        : 'حدث خطأ أثناء الاتصال بالخادم.';
     throw new ApiError(
-      typeof data.error === 'string' ? data.error : 'حدث خطأ أثناء الاتصال بالخادم.',
+      data && typeof data.error === 'string' ? data.error : fallbackMsg,
       response.status,
-      typeof data.fieldErrors === 'object' && data.fieldErrors ? data.fieldErrors : {},
+      data && typeof data.fieldErrors === 'object' && data.fieldErrors ? data.fieldErrors : {},
     );
+  }
+
+  if (!data || typeof data !== 'object') {
+    throw new ApiError('استجابة الخادم غير صالحة. يرجى تحديث الصفحة والمحاولة مرة أخرى.', response.status);
   }
   return data as T;
 }
@@ -73,6 +108,7 @@ export async function loginStudentApi(
     body: JSON.stringify(payload),
   });
   setStoredToken(result.token);
+  writeCachedJson(CACHED_STUDENT_KEY, result.student);
   return result;
 }
 
@@ -84,16 +120,30 @@ export async function registerStudentApi(
     body: JSON.stringify(payload),
   });
   setStoredToken(result.token);
+  writeCachedJson(CACHED_STUDENT_KEY, result.student);
   return result;
 }
 
 export async function fetchCurrentStudentApi(): Promise<PublicStudent | null> {
-  const result = await apiRequest<{ student: PublicStudent | null }>('/api/auth/me');
-  if (!result.student) {
-    setStoredToken('');
+  try {
+    const result = await apiRequest<{ student: PublicStudent | null }>('/api/auth/me');
+    if (!result.student) {
+      setStoredToken('');
+      writeCachedJson(CACHED_STUDENT_KEY, null);
+      return null;
+    }
+    writeCachedJson(CACHED_STUDENT_KEY, result.student);
+    return result.student;
+  } catch (err) {
+    if (err instanceof ApiError) {
+      throw err;
+    }
+    // Network/offline fallback: return last cached authenticated student if token exists
+    if (getStoredToken()) {
+      return readCachedJson<PublicStudent>(CACHED_STUDENT_KEY);
+    }
     return null;
   }
-  return result.student;
 }
 
 export async function updateCurrentStudentApi(
@@ -103,12 +153,23 @@ export async function updateCurrentStudentApi(
     method: 'PUT',
     body: JSON.stringify(payload),
   });
+  writeCachedJson(CACHED_STUDENT_KEY, result.student);
   return result.student;
 }
 
 export async function fetchAllStudentsApi(): Promise<PublicStudent[]> {
-  const result = await apiRequest<{ students: PublicStudent[] }>('/api/students');
-  return result.students;
+  try {
+    const result = await apiRequest<{ students: PublicStudent[] }>('/api/students');
+    writeCachedJson(CACHED_STUDENTS_KEY, result.students);
+    return result.students;
+  } catch (err) {
+    if (err instanceof ApiError) {
+      throw err;
+    }
+    const cached = readCachedJson<PublicStudent[]>(CACHED_STUDENTS_KEY);
+    if (cached) return cached;
+    throw err;
+  }
 }
 
 export async function logoutStudentApi(): Promise<void> {
@@ -116,5 +177,7 @@ export async function logoutStudentApi(): Promise<void> {
     await apiRequest<{ ok: boolean }>('/api/auth/logout', { method: 'POST' });
   } finally {
     setStoredToken('');
+    writeCachedJson(CACHED_STUDENT_KEY, null);
+    writeCachedJson(CACHED_STUDENTS_KEY, null);
   }
 }

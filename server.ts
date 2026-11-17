@@ -1,21 +1,21 @@
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
 import {
   authenticateStudent,
-  createSession as _createSession,
   deleteSession,
+  getStorageInfo,
   getStudentByToken,
   listAllPublicStudents,
   registerStudent,
   updateStudentProfile,
-} from './server/storage';
+} from './server/storage.ts';
 import {
   validateLoginInput,
   validateProfileUpdate,
   validateRegisterInput,
-} from './src/utils/studentLogic';
+} from './src/utils/studentLogic.ts';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SESSION_COOKIE = 'rowad_session';
@@ -33,7 +33,7 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
   return out;
 }
 
-function extractToken(req: express.Request): string {
+function extractToken(req: Request): string {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     return authHeader.slice(7).trim();
@@ -42,14 +42,14 @@ function extractToken(req: express.Request): string {
   return cookies[SESSION_COOKIE] ?? '';
 }
 
-function setSessionCookie(res: express.Response, token: string): void {
+function setSessionCookie(res: Response, token: string): void {
   res.setHeader(
     'Set-Cookie',
     `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`,
   );
 }
 
-function clearSessionCookie(res: express.Response): void {
+function clearSessionCookie(res: Response): void {
   res.setHeader(
     'Set-Cookie',
     `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
@@ -57,151 +57,252 @@ function clearSessionCookie(res: express.Response): void {
 }
 
 async function startServer() {
+  // Initialize SQLite storage eagerly on startup so schema/seed issues surface immediately
+  const storageInfo = getStorageInfo();
+
   const app = express();
   app.use(express.json());
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true });
-  });
-
-  app.post('/api/auth/register', (req, res) => {
-    const body = req.body ?? {};
-    const input = {
-      fullName: String(body.fullName ?? ''),
-      email: String(body.email ?? ''),
-      studentCode: body.studentCode ? String(body.studentCode) : undefined,
-      grade: String(body.grade ?? ''),
-      section: String(body.section ?? ''),
-      track: String(body.track ?? ''),
-      guardianPhone: String(body.guardianPhone ?? ''),
-      city: String(body.city ?? ''),
-      notes: body.notes ? String(body.notes) : '',
-      password: String(body.password ?? ''),
-      confirmPassword: String(body.confirmPassword ?? ''),
-    };
-
-    const validation = validateRegisterInput(input);
-    if (!validation.valid) {
-      res.status(400).json({
-        error: 'يرجى التحقق من الحقول المطلوبة.',
-        fieldErrors: validation.errors,
-      });
-      return;
-    }
-
-    const result = registerStudent(input);
-    if (!result.ok) {
-      res.status(409).json({
-        error: result.error,
-        fieldErrors: result.field ? { [result.field]: result.error } : {},
-      });
-      return;
-    }
-
-    setSessionCookie(res, result.token);
-    res.status(201).json({
-      student: result.student,
-      token: result.token,
-    });
-  });
-
-  app.post('/api/auth/login', (req, res) => {
-    const body = req.body ?? {};
-    const input = {
-      identifier: String(body.identifier ?? ''),
-      password: String(body.password ?? ''),
-    };
-
-    const validation = validateLoginInput(input);
-    if (!validation.valid) {
-      res.status(400).json({
-        error: 'يرجى إدخال بيانات تسجيل الدخول كاملة.',
-        fieldErrors: validation.errors,
-      });
-      return;
-    }
-
-    const result = authenticateStudent(input.identifier, input.password);
-    if (!result.ok) {
-      res.status(401).json({ error: result.error });
-      return;
-    }
-
-    setSessionCookie(res, result.token);
+    const info = getStorageInfo();
     res.json({
-      student: result.student,
-      token: result.token,
+      ok: true,
+      storage: info.engine,
+      students: info.studentCount,
     });
   });
 
-  app.post('/api/auth/logout', (req, res) => {
-    const token = extractToken(req);
-    deleteSession(token);
-    clearSessionCookie(res);
-    res.json({ ok: true });
-  });
+  app.post('/api/auth/register', (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      const input = {
+        fullName: String(body.fullName ?? ''),
+        email: String(body.email ?? ''),
+        studentCode: body.studentCode ? String(body.studentCode) : undefined,
+        grade: String(body.grade ?? ''),
+        section: String(body.section ?? ''),
+        track: String(body.track ?? ''),
+        guardianPhone: String(body.guardianPhone ?? ''),
+        city: String(body.city ?? ''),
+        notes: body.notes ? String(body.notes) : '',
+        password: String(body.password ?? ''),
+        confirmPassword: String(body.confirmPassword ?? ''),
+      };
 
-  app.get('/api/auth/me', (req, res) => {
-    const token = extractToken(req);
-    const student = getStudentByToken(token);
-    res.json({ student: student ?? null });
-  });
+      const validation = validateRegisterInput(input);
+      if (!validation.valid) {
+        res.status(400).json({
+          error: 'يرجى التحقق من الحقول المطلوبة.',
+          fieldErrors: validation.errors,
+        });
+        return;
+      }
 
-  app.put('/api/students/me', (req, res) => {
-    const token = extractToken(req);
-    const current = getStudentByToken(token);
-    if (!current) {
-      res.status(401).json({ error: 'غير مصرح. يرجى تسجيل الدخول.' });
-      return;
-    }
+      const result = registerStudent(input);
+      if (!result.ok) {
+        res.status(409).json({
+          error: result.error,
+          fieldErrors: result.field ? { [result.field]: result.error } : {},
+        });
+        return;
+      }
 
-    const body = req.body ?? {};
-    const updates = {
-      fullName: String(body.fullName ?? ''),
-      grade: String(body.grade ?? ''),
-      section: String(body.section ?? ''),
-      track: String(body.track ?? ''),
-      guardianPhone: String(body.guardianPhone ?? ''),
-      city: String(body.city ?? ''),
-      notes: String(body.notes ?? ''),
-    };
-
-    const validation = validateProfileUpdate(updates);
-    if (!validation.valid) {
-      res.status(400).json({
-        error: 'يرجى تصحيح البيانات المدخلة.',
-        fieldErrors: validation.errors,
+      setSessionCookie(res, result.token);
+      res.status(201).json({
+        student: result.student,
+        token: result.token,
       });
-      return;
+    } catch (err) {
+      next(err);
     }
-
-    const updated = updateStudentProfile(current.id, updates);
-    if (!updated) {
-      res.status(404).json({ error: 'لم يتم العثور على سجل الطالب.' });
-      return;
-    }
-
-    res.json({ student: updated });
   });
 
-  app.get('/api/students', (req, res) => {
-    const token = extractToken(req);
-    const current = getStudentByToken(token);
-    if (!current) {
-      res.status(401).json({ error: 'غير مصرح. يرجى تسجيل الدخول.' });
-      return;
+  app.post('/api/auth/login', (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      const input = {
+        identifier: String(body.identifier ?? ''),
+        password: String(body.password ?? ''),
+      };
+
+      const validation = validateLoginInput(input);
+      if (!validation.valid) {
+        res.status(400).json({
+          error: 'يرجى إدخال بيانات تسجيل الدخول كاملة.',
+          fieldErrors: validation.errors,
+        });
+        return;
+      }
+
+      const result = authenticateStudent(input.identifier, input.password);
+      if (!result.ok) {
+        res.status(401).json({ error: result.error });
+        return;
+      }
+
+      setSessionCookie(res, result.token);
+      res.json({
+        student: result.student,
+        token: result.token,
+      });
+    } catch (err) {
+      next(err);
     }
-    res.json({ students: listAllPublicStudents() });
+  });
+
+  app.post('/api/auth/logout', (req, res, next) => {
+    try {
+      const token = extractToken(req);
+      deleteSession(token);
+      clearSessionCookie(res);
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/auth/me', (req, res, next) => {
+    try {
+      const token = extractToken(req);
+      const student = getStudentByToken(token);
+      res.json({ student: student ?? null });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.put('/api/students/me', (req, res, next) => {
+    try {
+      const token = extractToken(req);
+      const current = getStudentByToken(token);
+      if (!current) {
+        res.status(401).json({ error: 'غير مصرح. يرجى تسجيل الدخول.' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const updates = {
+        fullName: String(body.fullName ?? ''),
+        grade: String(body.grade ?? ''),
+        section: String(body.section ?? ''),
+        track: String(body.track ?? ''),
+        guardianPhone: String(body.guardianPhone ?? ''),
+        city: String(body.city ?? ''),
+        notes: String(body.notes ?? ''),
+      };
+
+      const validation = validateProfileUpdate(updates);
+      if (!validation.valid) {
+        res.status(400).json({
+          error: 'يرجى تصحيح البيانات المدخلة.',
+          fieldErrors: validation.errors,
+        });
+        return;
+      }
+
+      const updated = updateStudentProfile(current.id, updates);
+      if (!updated) {
+        res.status(404).json({ error: 'لم يتم العثور على سجل الطالب.' });
+        return;
+      }
+
+      res.json({ student: updated });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/students', (req, res, next) => {
+    try {
+      const token = extractToken(req);
+      const current = getStudentByToken(token);
+      if (!current) {
+        res.status(401).json({ error: 'غير مصرح. يرجى تسجيل الدخول.' });
+        return;
+      }
+      res.json({ students: listAllPublicStudents() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Unknown API routes must return JSON 404 rather than falling back to index.html
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'نقطة الاتصال المطلوبة غير موجودة.' });
+  });
+
+  // Structured JSON error handler for all /api routes
+  app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('API database/server error:', err);
+    if (res.headersSent) return;
+    res.status(500).json({
+      error: 'حدث خطأ في قاعدة البيانات أثناء حفظ أو قراءة البيانات. يرجى المحاولة مرة أخرى.',
+    });
   });
 
   const isProd = process.env.NODE_ENV === 'production';
   const distPath = path.resolve(process.cwd(), 'dist');
 
+  const httpServer = http.createServer(app);
+
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false, ws: { server: httpServer } },
       appType: 'spa',
     });
+
+    // HMR is disabled in AI Studio: prevent @vite/client from opening a failing WebSocket
+    app.use('/@vite/client', (req, res, next) => {
+      delete req.headers['if-none-match'];
+      delete req.headers['if-modified-since'];
+      const chunks: Buffer[] = [];
+      const origWrite = res.write.bind(res);
+      const origEnd = res.end.bind(res);
+      let isRedirectOrError = false;
+
+      res.write = ((chunk: Buffer | string, ...args: unknown[]) => {
+        if (res.statusCode !== 200) {
+          isRedirectOrError = true;
+          return (origWrite as (...a: unknown[]) => boolean)(chunk, ...args);
+        }
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        return true;
+      }) as typeof res.write;
+
+      res.end = ((chunk?: Buffer | string, ...args: unknown[]) => {
+        if (isRedirectOrError || res.statusCode !== 200) {
+          return (origEnd as (...a: unknown[]) => typeof res)(chunk, ...args);
+        }
+        if (chunk) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const body = Buffer.concat(chunks)
+          .toString('utf-8')
+          .replace(
+            'const socketHost = `${null || importMetaUrl.hostname}:${hmrPort || importMetaUrl.port}${"/"}`;',
+            'const socketHost = `${importMetaUrl.host}/`;',
+          )
+          .replace(
+            'console.error(`[vite] failed to connect to websocket.your current setup:',
+            'console.debug(`[vite] websocket unavailable:',
+          )
+          .replace(
+            'console.error(`[vite] failed to connect to websocket (${e}). `);\n\t\t\t\tthrow e;',
+            'return;',
+          )
+          .replace(
+            'this.transport.send(payload).catch((err) => {\n\t\t\tthis.logger.error(err);\n\t\t});',
+            'this.transport.send(payload).catch(() => {});',
+          );
+        res.removeHeader('ETag');
+        res.setHeader('Content-Length', Buffer.byteLength(body));
+        return origEnd(body);
+      }) as typeof res.end;
+
+      next();
+    });
+
     app.use(vite.middlewares);
   } else if (fs.existsSync(distPath)) {
     app.use(express.static(distPath));
@@ -210,8 +311,10 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Rowad Al-Alam Student Platform running on http://localhost:${PORT}`);
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `Rowad Al-Alam Student Platform running on http://localhost:${PORT} (DB: ${storageInfo.engine} @ ${storageInfo.dbPath})`,
+    );
   });
 }
 

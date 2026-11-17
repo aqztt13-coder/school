@@ -1,5 +1,21 @@
 [
   {
+    "id": "stu-5916604b-9e31-4bd9-b7ac-d78f1bbd4583",
+    "studentCode": "RA-2026-105",
+    "fullName": "طالب اختبار",
+    "email": "test.db@rowad.edu.sa",
+    "grade": "الأول الثانوي",
+    "section": "أ",
+    "track": "المسار العام",
+    "guardianPhone": "0501112233",
+    "city": "الرياض",
+    "notes": "",
+    "enrollmentStatus": "مقيد ومُرحّل",
+    "createdAt": "2026-11-17T17:51:40.906Z",
+    "updatedAt": "2026-11-17T17:51:40.906Z",
+    "passwordHash": "c9c36606acc2585b0494dce4e11cb061:15c2ef99bfe609675705d8b9e8c1ef32aee1135cff61beeb60f13c5d3769cac0e5dcf2432234c9244b18bdf47fb1a62769c0cb55ba9360f0343fce3de473632b"
+  },
+  {
     "id": "stu-5c531a76-ef91-408e-a336-2739c04fbf58",
     "studentCode": "RA-2026-104",
     "fullName": "يوسف إبراهيم الغامدي",

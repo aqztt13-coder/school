@@ -1,5 +1,6 @@
 import { CheckCircle2, Edit3, Printer, Users } from 'lucide-react';
 import { formatArabicDate, type PublicStudent } from '../utils/studentLogic';
+import { PWAInstallButton } from './PWAInstallButton';
 import type { PortalTab } from './TopNav';
 
 const CREST_IMAGE_URL = '/src/assets/images/rowad_school_crest_1794898618509.jpg';
@@ -102,6 +103,7 @@ export function StudentDedicatedPage({
               <Printer className="h-4 w-4 text-slate-500" aria-hidden="true" />
               <span>طباعة البطاقة</span>
             </button>
+            <PWAInstallButton variant="subtle" />
           </div>
         </div>
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AuthScreen, type AuthMode } from './components/AuthScreen';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { StudentDedicatedPage } from './components/StudentDedicatedPage';
 import { StudentEditPage } from './components/StudentEditPage';
 import { StudentsDirectoryPage } from './components/StudentsDirectoryPage';
@@ -108,11 +109,14 @@ export default function App() {
 
   if (!student) {
     return (
-      <AuthScreen
-        mode={authMode}
-        onModeChange={handleAuthModeChange}
-        onAuthenticated={handleAuthenticated}
-      />
+      <>
+        <AuthScreen
+          mode={authMode}
+          onModeChange={handleAuthModeChange}
+          onAuthenticated={handleAuthenticated}
+        />
+        <OfflineIndicator />
+      </>
     );
   }
 
@@ -149,6 +153,7 @@ export default function App() {
       {portalTab === 'records' && (
         <StudentsDirectoryPage currentStudentId={student.id} />
       )}
+      <OfflineIndicator />
     </div>
   );
 }
