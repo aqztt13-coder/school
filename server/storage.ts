@@ -53,7 +53,7 @@ function isDirWritable(dir: string): boolean {
   }
 }
 
-function resolveWritableDataDir(): string {
+function getCandidateDataDirs(): string[] {
   const candidates = [
     process.env.ROWAD_DATA_DIR ? path.resolve(process.env.ROWAD_DATA_DIR) : '',
     process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : '',
@@ -61,13 +61,9 @@ function resolveWritableDataDir(): string {
     path.join(os.tmpdir(), 'rowad-school-data'),
   ].filter(Boolean);
 
-  for (const candidate of candidates) {
-    if (isDirWritable(candidate)) {
-      return candidate;
-    }
-  }
-
-  return os.tmpdir();
+  const unique = Array.from(new Set(candidates));
+  const writable = unique.filter((dir) => isDirWritable(dir));
+  return writable.length > 0 ? writable : [os.tmpdir()];
 }
 
 export function hashPassword(password: string): string {
@@ -262,21 +258,96 @@ function seedOrMigrateDatabase(db: DatabaseSync, dataDir: string): void {
   }
 }
 
-function getDb(): DatabaseSync {
-  if (dbInstance) return dbInstance;
+const REQUIRED_STUDENT_COLUMNS: Record<string, string> = {
+  student_code: "TEXT NOT NULL DEFAULT ''",
+  full_name: "TEXT NOT NULL DEFAULT ''",
+  email: "TEXT NOT NULL DEFAULT ''",
+  grade: "TEXT NOT NULL DEFAULT ''",
+  section: "TEXT NOT NULL DEFAULT ''",
+  track: "TEXT NOT NULL DEFAULT ''",
+  guardian_phone: "TEXT NOT NULL DEFAULT ''",
+  city: "TEXT NOT NULL DEFAULT ''",
+  notes: "TEXT NOT NULL DEFAULT ''",
+  enrollment_status: "TEXT NOT NULL DEFAULT 'مقيد ومُرحّل'",
+  created_at: "TEXT NOT NULL DEFAULT ''",
+  updated_at: "TEXT NOT NULL DEFAULT ''",
+  password_hash: "TEXT NOT NULL DEFAULT ''",
+};
 
-  const dataDir = resolveWritableDataDir();
-  const dbPath = path.join(dataDir, 'rowad.db');
+const REQUIRED_SESSION_COLUMNS: Record<string, string> = {
+  student_id: "TEXT NOT NULL DEFAULT ''",
+  created_at: "TEXT NOT NULL DEFAULT ''",
+};
 
-  const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA foreign_keys = ON;');
-  db.exec('PRAGMA busy_timeout = 5000;');
-  try {
-    db.exec('PRAGMA journal_mode = WAL;');
-  } catch {
-    // WAL mode may be unsupported on some virtual filesystems; default journal mode works
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isCorruptionError(err: unknown): boolean {
+  const msg = errorMessage(err).toLowerCase();
+  return (
+    msg.includes('malformed') ||
+    msg.includes('not a database') ||
+    msg.includes('file is encrypted') ||
+    msg.includes('disk image')
+  );
+}
+
+/**
+ * A leftover "-wal" / "-shm" file without its main database (or left over from a different
+ * database file) makes SQLite fail or behave unpredictably. Move such files aside (never delete,
+ * so no data is lost) before opening the database.
+ */
+function quarantineOrphanedJournalFiles(dbPath: string): void {
+  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) return;
+  const stamp = Date.now();
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    const side = `${dbPath}${suffix}`;
+    if (!fs.existsSync(side)) continue;
+    try {
+      fs.renameSync(side, `${side}.orphan-${stamp}`);
+      console.warn(`[storage] Moved orphaned SQLite file aside: ${side}`);
+    } catch {
+      try {
+        fs.unlinkSync(side);
+      } catch {
+        // Ignore: opening will surface a real error if this still blocks us
+      }
+    }
   }
+}
 
+function quarantineDatabaseFiles(dbPath: string): void {
+  const stamp = Date.now();
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    const file = `${dbPath}${suffix}`;
+    if (!fs.existsSync(file)) continue;
+    try {
+      fs.renameSync(file, `${file}.corrupt-${stamp}`);
+    } catch {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+  console.warn(`[storage] Unreadable database was moved aside: ${dbPath}.corrupt-${stamp}`);
+}
+
+function ensureColumns(db: DatabaseSync, table: string, required: Record<string, string>): void {
+  const existing = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  for (const [column, definition] of Object.entries(required)) {
+    if (!existing.has(column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      console.warn(`[storage] Added missing column ${table}.${column} (old database schema)`);
+    }
+  }
+}
+
+function initializeSchema(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS students (
       id TEXT PRIMARY KEY,
@@ -301,18 +372,80 @@ function getDb(): DatabaseSync {
       created_at TEXT NOT NULL,
       FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
     );
+  `);
 
+  // Databases created by an older version may lack columns, which only breaks INSERTs
+  // (i.e. registration) while login/read keeps working.
+  ensureColumns(db, 'students', REQUIRED_STUDENT_COLUMNS);
+  ensureColumns(db, 'sessions', REQUIRED_SESSION_COLUMNS);
+
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_students_email ON students(email);
     CREATE INDEX IF NOT EXISTS idx_students_code ON students(student_code);
     CREATE INDEX IF NOT EXISTS idx_sessions_student_id ON sessions(student_id);
   `);
+}
 
-  seedOrMigrateDatabase(db, dataDir);
+function openDatabaseAt(dataDir: string): { db: DatabaseSync; dbPath: string } {
+  const dbPath = path.join(dataDir, 'rowad.db');
 
-  dbInstance = db;
-  activeDataDir = dataDir;
-  activeDbPath = dbPath;
-  return db;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    quarantineOrphanedJournalFiles(dbPath);
+    let db: DatabaseSync | null = null;
+    try {
+      db = new DatabaseSync(dbPath);
+      db.exec('PRAGMA busy_timeout = 5000;');
+      try {
+        db.exec('PRAGMA journal_mode = WAL;');
+      } catch {
+        // WAL mode may be unsupported on some virtual filesystems; default journal mode works
+      }
+      db.exec('PRAGMA foreign_keys = ON;');
+
+      initializeSchema(db);
+
+      // Prove the database is really writable now, so we fail here (and can fall back to
+      // another location) instead of at the moment a student presses "register".
+      db.exec('BEGIN IMMEDIATE;');
+      db.exec('ROLLBACK;');
+
+      seedOrMigrateDatabase(db, dataDir);
+      return { db, dbPath };
+    } catch (err) {
+      try {
+        db?.close();
+      } catch {
+        // Ignore close errors
+      }
+      if (attempt === 0 && fs.existsSync(dbPath) && isCorruptionError(err)) {
+        console.error('[storage] Database file is corrupt, recreating it:', errorMessage(err));
+        quarantineDatabaseFiles(dbPath);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Unable to open database');
+}
+
+function getDb(): DatabaseSync {
+  if (dbInstance) return dbInstance;
+
+  let lastError: unknown = null;
+  for (const dataDir of getCandidateDataDirs()) {
+    try {
+      const { db, dbPath } = openDatabaseAt(dataDir);
+      dbInstance = db;
+      activeDataDir = dataDir;
+      activeDbPath = dbPath;
+      return db;
+    } catch (err) {
+      lastError = err;
+      console.error(`[storage] Cannot use database in ${dataDir}:`, errorMessage(err));
+    }
+  }
+
+  throw lastError ?? new Error('No writable location found for the database');
 }
 
 export function getStorageInfo(): { engine: 'sqlite'; dataDir: string; dbPath: string; studentCount: number } {
@@ -367,7 +500,7 @@ export function getStudentByToken(token: string): PublicStudent | null {
   return row ? toPublicStudent(rowToStoredStudent(row)) : null;
 }
 
-export function registerStudent(input: RegisterInput): {
+function registerStudentOnce(input: RegisterInput): {
   ok: true;
   student: PublicStudent;
   token: string;
@@ -411,7 +544,7 @@ export function registerStudent(input: RegisterInput): {
       const codeRows = db.prepare('SELECT student_code FROM students').all() as Array<{
         student_code: string;
       }>;
-      studentCode = generateStudentCode(codeRows.map((r) => r.student_code));
+      studentCode = generateStudentCode(codeRows.map((r) => String(r.student_code).toUpperCase()));
     }
 
     const now = new Date().toISOString();
@@ -475,6 +608,55 @@ export function registerStudent(input: RegisterInput): {
     }
     throw err;
   }
+}
+
+type RegisterResult =
+  | { ok: true; student: PublicStudent; token: string }
+  | { ok: false; error: string; field?: string };
+
+function uniqueViolation(err: unknown): 'email' | 'studentCode' | 'other' | null {
+  const msg = errorMessage(err);
+  if (!msg.includes('UNIQUE constraint failed')) return null;
+  if (msg.includes('students.email')) return 'email';
+  if (msg.includes('students.student_code')) return 'studentCode';
+  return 'other';
+}
+
+function isBusyError(err: unknown): boolean {
+  const msg = errorMessage(err).toLowerCase();
+  return msg.includes('database is locked') || msg.includes('busy');
+}
+
+export function registerStudent(input: RegisterInput): RegisterResult {
+  const autoCode = !input.studentCode;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return registerStudentOnce(input);
+    } catch (err) {
+      lastError = err;
+      const violation = uniqueViolation(err);
+      if (violation === 'email') {
+        return {
+          ok: false,
+          error: 'هذا البريد الإلكتروني مسجل مسبقاً في منصة المدرسة.',
+          field: 'email',
+        };
+      }
+      if (violation === 'studentCode') {
+        if (autoCode) continue; // someone took the generated number first: generate a new one
+        return {
+          ok: false,
+          error: 'الرقم المدرسي المدخل مسجل لطالب آخر.',
+          field: 'studentCode',
+        };
+      }
+      if (isBusyError(err)) continue;
+      throw err;
+    }
+  }
+  throw lastError;
 }
 
 export function authenticateStudent(identifier: string, password: string): {
